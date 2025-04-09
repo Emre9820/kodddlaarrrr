@@ -1,0 +1,548 @@
+import os
+import numpy as np
+import pandas as pd
+import joblib
+from collections import defaultdict
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, random_split
+from sklearn.preprocessing import QuantileTransformer, LabelEncoder,PowerTransformer,StandardScaler
+from sklearn.model_selection import train_test_split
+
+# Reproducibility için seed ayarı
+np.random.seed(42)
+torch.manual_seed(42)
+
+###############################################
+# SNV Uygulama Fonksiyonu
+###############################################
+def snv(data):
+    """
+    Standard Normal Variate (SNV) dönüşümü uygular.
+
+    Args:
+        data: NumPy dizisi (örnekler x özellikler)
+
+    Returns:
+        SNV uygulanmış NumPy dizisi
+    """
+    data = np.array(data)
+    # Her satır için ortalama ve standart sapma hesapla
+    mean = np.mean(data, axis=1, keepdims=True)
+    std = np.std(data, axis=1, keepdims=True)
+    # SNV uygula (sıfır standart sapma durumunda sıfır bölme hatasını önle)
+    snv_data = np.where(std == 0, 0, (data - mean) / std)
+    return snv_data
+
+###############################################
+# Merkezi Fark Yöntemi ile 1. Türev - EKLENDİ
+###############################################
+def central_difference(data):
+    """
+    Merkezi fark yöntemi ile 1. türevi hesaplar.
+    Kenar noktalar için ileri ve geri fark kullanılır.
+
+    Args:
+        data: NumPy dizisi (örnekler x özellikler)
+
+    Returns:
+        1. türev uygulanmış NumPy dizisi (orijinal boyut korunur)
+    """
+    data = np.asarray(data, dtype=np.float64) # Hesaplama hassasiyeti için
+    if data.ndim == 1: # Tek bir örnek gelirse 2D yap
+        data = data.reshape(1, -1)
+    if data.shape[1] < 2: # Türev için en az 2 nokta gerekir
+        print("Uyarı: Türev hesaplamak için yetersiz özellik sayısı. Orijinal veri döndürülüyor.")
+        return data
+
+    derivative = np.zeros_like(data) # Sonuç için aynı boyutta array
+
+    # İlk nokta için ileri fark: f'(x0) ≈ f(x1) - f(x0)
+    derivative[:, 0] = data[:, 1] - data[:, 0]
+
+    # Orta noktalar için merkezi fark: f'(xi) ≈ (f(xi+1) - f(xi-1)) / 2
+    derivative[:, 1:-1] = (data[:, 2:] - data[:, :-2]) / 2.0
+
+    # Son nokta için geri fark: f'(xn) ≈ f(xn) - f(xn-1)
+    derivative[:, -1] = data[:, -1] - data[:, -2]
+
+    return derivative
+
+###############################################
+# Veri Yükleme Fonksiyonu (Üç Dosyayı Birleştirerek)
+###############################################
+def load_data(data_dir, mode='train'):
+    """
+    Verileri yükler ve özellik çıkarımı yapar.
+
+    Args:
+        data_dir: Ana dizin (örneğin, /home/han/Documents/INNO_split_dataset_seffaf1/Train)
+        mode: 'train' veya 'predict'
+
+    Returns:
+        data_a, data_i, data_r: NumPy dizileri
+        labels veya file_labels: Liste
+    """
+    data_a, data_i, data_r = [], [], []
+    labels = []  # Eğitim için gerçek etiketler (ana/alt)
+    file_labels = []  # Tahmin modunda gerçek etiket bilgisini saklamak için
+
+    for main_folder in os.listdir(data_dir):
+        main_class_path = os.path.join(data_dir, main_folder)
+        if not os.path.isdir(main_class_path):
+            continue
+
+        for path, _, _ in os.walk(main_class_path):
+            # Ana klasörün kendisinde (alt klasör yok) dosya varsa atla
+            if path == main_class_path:
+                continue
+
+            file_groups = defaultdict(dict)
+            for file_name in os.listdir(path):
+                # Sadece _a, _i ve _r.csv dosyalarını dikkate al
+                if file_name.endswith(("_a.csv", "_i.csv", "_r.csv")):
+                    base_name = file_name.rsplit('_', 1)[0]
+                    suffix = file_name.split('_')[-1].split('.')[0]
+                    full_path = os.path.join(path, file_name)
+                    file_groups[base_name][suffix] = full_path
+
+            for base_name, files in file_groups.items():
+                if set(files.keys()) == {'a', 'i', 'r'}:
+                    try:
+                        # CSV dosyalarını oku (skiprows ile üst bilgileri atla)
+                        df_a = pd.read_csv(files['a'], skiprows=28)
+                        df_i = pd.read_csv(files['i'], skiprows=28)
+                        df_r = pd.read_csv(files['r'], skiprows=28)
+
+                        # Özellik çıkarımı: her dosyada ikinci sütundaki veriler
+                        feat_a = df_a.iloc[:, 1].values.flatten()
+                        feat_i = df_i.iloc[:, 1].values.flatten()
+                        feat_r = df_r.iloc[:, 1].values.flatten()
+
+                        data_a.append(feat_a)
+                        data_i.append(feat_i)
+                        data_r.append(feat_r)
+
+                        # Gerçek etiket: alt klasör yapısı "ana/alt" şeklinde
+                        true_label = os.path.join(
+                            os.path.basename(os.path.dirname(path)),
+                            os.path.basename(path)
+                        )
+                        if mode == 'train':
+                            labels.append(true_label)
+                        else:
+                            file_labels.append(true_label)
+                    except Exception as e:
+                        print(f"Hata: {base_name} işlenirken hata oluştu: {e}. Atlanıyor.")
+
+    if mode == 'train':
+        return np.array(data_a), np.array(data_i), np.array(data_r), labels
+    else:
+        return np.array(data_a), np.array(data_i), np.array(data_r), file_labels
+
+###############################################
+# PyTorch Dataset Tanımı
+###############################################
+class SpectralDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = X  # Her örnek, birleşik özellik vektörü
+        self.y = y  # Sayısal etiketler
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        # CNN için giriş: (1, input_size)
+        sample = torch.tensor(self.X[idx], dtype=torch.float32).unsqueeze(0)
+        label = torch.tensor(self.y[idx], dtype=torch.long)
+        return sample, label
+
+###############################################
+# CNN Model Tanımı
+###############################################
+class CNN(nn.Module):
+    def __init__(self, input_size, num_classes):
+        super(CNN, self).__init__()
+        self.conv1 = nn.Conv1d(1, 32, kernel_size=3, stride=1, padding=1)
+        self.relu1 = nn.ReLU()
+        self.conv2 = nn.Conv1d(32, 64, kernel_size=3, stride=1, padding=1)
+        self.relu2 = nn.ReLU()
+        self.pool1 = nn.MaxPool1d(kernel_size=2, stride=2)
+        self.conv3 = nn.Conv1d(64, 128, kernel_size=3, stride=1, padding=1)
+        self.relu3 = nn.ReLU()
+        self.pool2 = nn.MaxPool1d(kernel_size=2, stride=2)
+        self.conv4 = nn.Conv1d(128, 256, kernel_size=3, stride=1, padding=1)
+        self.relu4 = nn.ReLU()
+        self.pool3 = nn.MaxPool1d(kernel_size=2, stride=2)
+        self.fc1 = nn.Linear(256 * (input_size // 8), 512)  # pooling sonrası boyut
+        self.ln1 = nn.LayerNorm(512)
+        self.relu5 = nn.ReLU()
+        self.dropout = nn.Dropout(p=0.3)
+        self.fc2 = nn.Linear(512, num_classes)
+
+    def forward(self, x):
+        x = self.relu1(self.conv1(x))
+        x = self.relu2(self.conv2(x))
+        x = self.pool1(x)
+        x = self.relu3(self.conv3(x))
+        x = self.pool2(x)
+        x = self.relu4(self.conv4(x))
+        x = self.pool3(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc1(x)
+        x = self.ln1(x)
+        x = self.relu5(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x
+
+###############################################
+# Tahmin Sonuçlarını Grup Bazında Raporlama
+###############################################
+def print_grouped_predictions_summary(predictions):
+    """
+    Tahmin sonuçlarını, gerçek etiket (ana/alt) bazında gruplandırarak raporlar.
+
+    Args:
+        predictions: List of tuples (true_label, predicted_label, predicted_prob)
+    """
+    import pandas as pd
+    df = pd.DataFrame(predictions, columns=['Gerçek', 'Tahmin', 'Olasılık'])
+
+    grouped_true = df.groupby('Gerçek')
+    total_correct_predictions = 0
+    total_wrong_predictions = 0
+
+    for true_label, group in grouped_true:
+        total = len(group)
+        true_main = true_label.split('/')[0]
+
+        # Doğru tahmin: tahmin edilen etiketin ana kısmı gerçek ana ile eşleşiyorsa
+        correct_mask = group['Tahmin'].apply(lambda x: x.split('/')[0] == true_main)
+        correct_group = group[correct_mask]
+        correct_count = len(correct_group)
+        accuracy = (correct_count / total) * 100 if total > 0 else 0
+
+        print(f"Gerçek: {true_label}")
+        print(f"  Doğru tahminler ({true_main}): {correct_count} dosya, Doğruluk: %{accuracy:.2f}")
+
+        total_correct_predictions += correct_count
+        total_wrong_predictions += (total - correct_count)
+
+        wrong_group = group[~correct_mask]
+        if not wrong_group.empty:
+            # Yanlış tahminleri alt klasörleriyle birlikte grupla
+            wrong_summary = wrong_group.groupby('Tahmin').agg(
+                count=('Tahmin', 'count'),
+                avg_prob=('Olasılık', 'mean')
+            ).reset_index()
+            wrong_summary = wrong_summary.sort_values(by='count', ascending=False).head(3)
+
+            print("  Yanlış tahminler:")
+            for _, row in wrong_summary.iterrows():
+                print(f"    {row['Tahmin']}: {row['count']} dosya, Ortalama Olasılık: {row['avg_prob']:.4f}")
+        print("")
+
+    total_predictions = len(predictions)
+    overall_accuracy = (total_correct_predictions / total_predictions) * 100 if total_predictions > 0 else 0
+    print(
+        f"Toplamda {total_predictions} prediction verisinden, {total_correct_predictions} doğru, {total_wrong_predictions} yanlış veri var. Doğruluk oranı: %{overall_accuracy:.2f}")
+
+def print_class_based_accuracy(predictions):
+    """
+    Her sınıf için doğru ve yanlış tahmin sayısını ve doğruluğunu hesaplar ve yazdırır.
+    """
+    import pandas as pd
+    df = pd.DataFrame(predictions, columns=['Gerçek', 'Tahmin', 'Olasılık'])
+
+    all_classes = set(df['Gerçek'].unique())
+    all_classes.update(df['Tahmin'].unique())
+
+    for class_name in sorted(all_classes):
+
+        class_df = df[df['Gerçek'] == class_name]
+        if class_df.empty:
+            continue
+
+        total_samples = len(class_df)
+        correct_predictions = len(class_df[class_df['Gerçek'] == class_df['Tahmin']])
+
+        accuracy = (correct_predictions / total_samples) * 100 if total_samples > 0 else 0
+
+        print(f"Sınıf: {class_name}")
+        print(f"  Toplam örnek: {total_samples}")
+        print(f"  Doğru tahmin: {correct_predictions}")
+        print(f"  Yanlış tahmin: {total_samples - correct_predictions}")
+        print(f"  Doğruluk: %{accuracy:.2f}")
+        print("")
+
+###############################################
+# Ana Fonksiyon: Eğitim ve Tahmin
+###############################################
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    ##############################
+    # 1. Eğitim
+    ##############################
+    TRAIN_DIR = "/home/han/Documents/500_veri/Train"
+
+    print("Eğitim verisi yükleniyor...")
+    data_a, data_i, data_r, train_labels = load_data(TRAIN_DIR, mode='train')
+    print(f"Eğitim verisi boyutu: {data_a.shape}, {data_i.shape}, {data_r.shape}\n")
+
+    # Eğitim ve doğrulama verilerini ayırma
+    data_a_train, data_a_val, data_i_train, data_i_val, data_r_train, data_r_val, train_labels_train, train_labels_val = train_test_split(
+        data_a, data_i, data_r, train_labels, test_size=0.2, random_state=42
+    )
+
+    # --- EĞİTİM VERİSİ ÖN İŞLEME ---
+    print("Eğitim verisine ön işleme uygulanıyor (SNV -> Türev -> Ölçekleme)...")
+    # SNV uygula
+    data_a_snv_train = snv(data_a_train)
+    data_i_snv_train = snv(data_i_train)
+    data_r_snv_train = snv(data_r_train)
+
+    # 1. Türev uygula (SNV'den sonra) - DEĞİŞİKLİK
+    data_a_deriv_train = central_difference(data_a_snv_train)
+    data_i_deriv_train = central_difference(data_i_snv_train)
+    data_r_deriv_train = central_difference(data_r_snv_train)
+
+    # Ölçeklendirme: her dosya türü için ayrı QuantileTransformer
+    scaler_a = PowerTransformer()
+    scaler_i = PowerTransformer()
+    scaler_r = PowerTransformer()
+
+    # SADECE EĞİTİM VERİSİ İLE FİT (Türevli veri ile) - DEĞİŞİKLİK
+    data_a_scaled_train = scaler_a.fit_transform(data_a_deriv_train)
+    data_i_scaled_train = scaler_i.fit_transform(data_i_deriv_train)
+    data_r_scaled_train = scaler_r.fit_transform(data_r_deriv_train)
+
+    # Ölçekleyicileri kaydet (eğitimden sonra)
+    joblib.dump(scaler_a, "scaler_a.pkl")
+    joblib.dump(scaler_i, "scaler_i.pkl")
+    joblib.dump(scaler_r, "scaler_r.pkl")
+
+    # --- DOĞRULAMA VERİSİ ÖN İŞLEME ---
+    print("Doğrulama verisine ön işleme uygulanıyor (SNV -> Türev -> Ölçekleme)...")
+    # SNV uygula
+    data_a_snv_val = snv(data_a_val)
+    data_i_snv_val = snv(data_i_val)
+    data_r_snv_val = snv(data_r_val)
+
+    # 1. Türev uygula (SNV'den sonra) - DEĞİŞİKLİK
+    data_a_deriv_val = central_difference(data_a_snv_val)
+    data_i_deriv_val = central_difference(data_i_snv_val)
+    data_r_deriv_val = central_difference(data_r_snv_val)
+
+    # Doğrulama verilerini transform et (Türevli veri ile) - DEĞİŞİKLİK
+    data_a_scaled_val = scaler_a.transform(data_a_deriv_val)
+    data_i_scaled_val = scaler_i.transform(data_i_deriv_val)
+    data_r_scaled_val = scaler_r.transform(data_r_deriv_val)
+
+    # Birleştir: her örnek için özellik vektörleri yan yana
+    train_features = np.concatenate((data_a_scaled_train, data_i_scaled_train, data_r_scaled_train), axis=1)
+    val_features = np.concatenate((data_a_scaled_val, data_i_scaled_val, data_r_scaled_val), axis=1)
+
+    # Etiket kodlama (ana/alt şeklinde)
+    y_encoder = LabelEncoder()
+    y_train = y_encoder.fit_transform(train_labels_train)
+    y_val = y_encoder.transform(train_labels_val)  # validation verisinide transform et
+    joblib.dump(y_encoder, "label_encoder.pkl")
+
+    # Dataset oluşturma
+    train_dataset = SpectralDataset(train_features, y_train)
+    val_dataset = SpectralDataset(val_features, y_val)
+
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+
+    # Model tanımlama
+    input_size = train_features.shape[1]  # Türev boyutu değiştirmediği için bu satır aynı kalır
+    num_classes = len(np.unique(y_train))
+    model = CNN(input_size, num_classes).to(device)
+
+    # Loss fonksiyonu, optimizer (AdamW, lr=0.01) ve scheduler (ReduceLROnPlateau)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=0.01)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
+
+    epochs = 5000
+    best_val_loss = np.inf
+    early_stop_patience = 10
+    early_stop_counter = 0
+    best_epoch = -1
+    best_train_loss = np.inf
+    best_train_acc = 0.0
+    best_val_acc = 0.0
+
+    # Grafik için listeler
+    train_losses = []
+    val_losses = []
+    train_accuracies = []
+    val_accuracies = []
+
+    print("Model eğitiliyor...\n")
+    for epoch in range(epochs):
+        # Eğitim
+        model.train()
+        train_loss = 0.0
+        correct_train = 0
+        total_train = 0
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item() * inputs.size(0)
+            _, predicted = torch.max(outputs, 1)
+            total_train += labels.size(0)
+            correct_train += (predicted == labels).sum().item()
+        train_loss /= total_train
+        train_acc = correct_train / total_train * 100
+
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        correct_val = 0
+        total_val = 0
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item() * inputs.size(0)
+                _, predicted = torch.max(outputs, 1)
+                total_val += labels.size(0)
+                correct_val += (predicted == labels).sum().item()
+        val_loss /= total_val
+        val_acc = correct_val / total_val * 100
+
+        scheduler.step(val_loss)
+
+        print(
+            f"Epoch {epoch + 1}/{epochs} - Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}% | Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+
+        # Grafik için değerleri kaydet
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_accuracies.append(train_acc)
+        val_accuracies.append(val_acc)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch + 1
+            best_train_loss = train_loss
+            best_train_acc = train_acc
+            best_val_acc = val_acc
+            early_stop_counter = 0
+            torch.save(model.state_dict(), "best_cnn_model.pth")
+        else:
+            early_stop_counter += 1
+            if early_stop_counter >= early_stop_patience:
+                print("Erken durdurma: validation loss artışı devam ediyor.")
+                break
+    print(
+        f"\nEn iyi epoch: {best_epoch} - Train Loss: {best_train_loss:.4f}, Train Acc: {best_train_acc:.2f}% | Val Loss: {best_val_loss:.4f}, Val Acc: {best_val_acc:.2f}%")
+    print("\nModel başarıyla kaydedildi!\n")
+
+    # Grafik çizimi
+    plt.figure(figsize=(12, 4))
+
+    plt.subplot(1, 2, 1)
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Training and Validation Loss')
+
+    plt.subplot(1, 2, 2)
+    plt.plot(train_accuracies, label='Train Accuracy')
+    plt.plot(val_accuracies, label='Validation Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy (%)')
+    plt.legend()
+    plt.title('Training and Validation Accuracy')
+
+    plt.tight_layout()
+    plt.show()
+
+    ##############################
+    # 2. Tahmin
+    ##############################
+    SAMPLE_DIR = "/home/han/Documents/Prediction"
+    print("Tahmin verileri yükleniyor...")
+    try:
+        # Üç dosya türünü ayrı ayrı yükle
+        data_a_pred, data_i_pred, data_r_pred, true_labels = load_data(SAMPLE_DIR, mode='predict')
+
+        # --- TAHMİN VERİSİ ÖN İŞLEME ---
+        print("Tahmin verisine ön işleme uygulanıyor (SNV -> Türev -> Ölçekleme)...")
+        # SNV uygula
+        data_a_pred_snv = snv(data_a_pred)
+        data_i_pred_snv = snv(data_i_pred)
+        data_r_pred_snv = snv(data_r_pred)
+
+        # 1. Türev uygula (SNV'den sonra) - DEĞİŞİKLİK
+        data_a_pred_deriv = central_difference(data_a_pred_snv)
+        data_i_pred_deriv = central_difference(data_i_pred_snv)
+        data_r_pred_deriv = central_difference(data_r_pred_snv)
+
+        # Ölçekleyicileri yükle
+        scaler_a = joblib.load("scaler_a.pkl")
+        scaler_i = joblib.load("scaler_i.pkl")
+        scaler_r = joblib.load("scaler_r.pkl")
+
+        # Tahmin verilerini transform et (Türevli veri ile) - DEĞİŞİKLİK
+        data_a_pred_scaled = scaler_a.transform(data_a_pred_deriv)
+        data_i_pred_scaled = scaler_i.transform(data_i_pred_deriv)
+        data_r_pred_scaled = scaler_r.transform(data_r_pred_deriv)
+
+        # Birleştir
+        pred_features = np.concatenate((data_a_pred_scaled, data_i_pred_scaled, data_r_pred_scaled), axis=1)
+
+        # En iyi modeli yükle
+        model = CNN(input_size, num_classes).to(device)
+        model.load_state_dict(torch.load("best_cnn_model.pth", map_location=device))
+        model.eval()
+        y_encoder = joblib.load("label_encoder.pkl")
+
+        # Tahmin için Dataset/DataLoader
+        pred_dataset = SpectralDataset(pred_features, np.zeros(len(pred_features))) # Dummy etiketler
+        pred_loader = DataLoader(pred_dataset, batch_size=1, shuffle=False)
+
+        # Tahmin yapma
+        predictions = []
+        with torch.no_grad():
+            for idx, (inputs, _) in enumerate(pred_loader):
+                inputs = inputs.to(device)
+                outputs = model(inputs)
+                probs = F.softmax(outputs, dim=1).cpu().numpy().flatten()
+                pred_idx = np.argmax(probs)
+                pred_class = y_encoder.inverse_transform([pred_idx])[0]
+                pred_prob = float(probs[pred_idx])
+                true_label = true_labels[idx]
+                predictions.append((true_label, pred_class, pred_prob))
+
+        # Sonuçları yazdırma
+        print_grouped_predictions_summary(predictions)
+        print("\n")
+        print_class_based_accuracy(predictions)
+        print("Tahmin işlemi başarıyla tamamlandı!")
+
+    except FileNotFoundError:
+        print("Hata: Kayıtlı model veya ölçekleyici dosyaları bulunamadı. Lütfen önce modeli eğitin.")
+    except Exception as e:
+        print(f"Tahmin sırasında bir hata oluştu: {str(e)}")
+
+if __name__ == "__main__":
+    main()
+
