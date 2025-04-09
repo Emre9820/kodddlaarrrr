@@ -6,7 +6,7 @@ from collections import defaultdict
 import matplotlib.pyplot as plt # Grafik çizimi için eklendi
 
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, classification_report # accuracy_score eklendi
 from sklearn.model_selection import train_test_split
 
 import torch
@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F # Softmax için eklendi
-from torch.optim.lr_scheduler import ReduceLROnPlateau # Scheduler için eklendi
+# from torch.optim.lr_scheduler import ReduceLROnPlateau # Scheduler için eklendi (zaten import edilmiş)
 
 # Reproducibility için seed ayarı
 np.random.seed(42)
@@ -42,11 +42,11 @@ def load_data(data_dir, mode='train'):
 
             for file_name in os.listdir(path):
                 # Mevcut kodda _a.csv okunuyor, ona göre devam ediyorum.
-                # Eğer _i.csv isteniyorsa burayı "_i.csv" olarak değiştirin.
                 if file_name.endswith("_a.csv"):
                     try:
                         file_path = os.path.join(path, file_name)
                         df_a = pd.read_csv(file_path, skiprows=28)
+                        # İkinci sütundaki verileri al (Absorbance (AU))
                         feat_a = df_a.iloc[:, 1].values.flatten()
                         data_a.append(feat_a)
 
@@ -67,34 +67,66 @@ def load_data(data_dir, mode='train'):
         return np.array(data_a), file_labels
 
 ###############################################
-# ANN Model Tanımı (Değişiklik yok)
+# CNN Model Tanımı - GÜNCELLENDİ
 ###############################################
-class ANN(nn.Module):
-    def __init__(self, input_size, hidden_size, num_classes):
-        super(ANN, self).__init__()
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(hidden_size, num_classes)
+class CNN(nn.Module):
+    def __init__(self, input_size, num_classes):
+        super(CNN, self).__init__()
+        self.conv1 = nn.Conv1d(1, 32, kernel_size=3, stride=1, padding=1)
+        self.relu1 = nn.ReLU()
+        self.conv2 = nn.Conv1d(32, 64, kernel_size=3, stride=1, padding=1)
+        self.relu2 = nn.ReLU()
+        self.pool1 = nn.MaxPool1d(kernel_size=2, stride=2)
+        self.conv3 = nn.Conv1d(64, 128, kernel_size=3, stride=1, padding=1)
+        self.relu3 = nn.ReLU()
+        self.pool2 = nn.MaxPool1d(kernel_size=2, stride=2)
+        self.conv4 = nn.Conv1d(128, 256, kernel_size=3, stride=1, padding=1)
+        self.relu4 = nn.ReLU()
+        self.pool3 = nn.MaxPool1d(kernel_size=2, stride=2)
+        # Pooling sonrası boyutu dinamik olarak hesapla
+        # Her MaxPool1d(kernel_size=2, stride=2) işlemi uzunluğu yarıya indirir.
+        # 3 pooling katmanı olduğu için input_size // (2*2*2) = input_size // 8
+        # Eğer input_size 8'e tam bölünmüyorsa, PyTorch otomatik olarak floor işlemi yapar.
+        # Bu yüzden `input_size // 8` genellikle doğrudur.
+        # Emin olmak için küçük bir veriyle modelden geçirip fc1 öncesi boyuta bakılabilir.
+        self.fc1 = nn.Linear(256 * (input_size // 8), 512)
+        self.ln1 = nn.LayerNorm(512)
+        self.relu5 = nn.ReLU()
+        self.dropout = nn.Dropout(p=0.3)
+        self.fc2 = nn.Linear(512, num_classes)
 
     def forward(self, x):
-        out = self.fc1(x)
-        out = self.relu(out)
-        out = self.fc2(out)
-        return out
+        # Girdi x: (batch_size, 1, input_size) olmalı
+        x = self.relu1(self.conv1(x))
+        x = self.relu2(self.conv2(x))
+        x = self.pool1(x)
+        x = self.relu3(self.conv3(x))
+        x = self.pool2(x)
+        x = self.relu4(self.conv4(x))
+        x = self.pool3(x)
+        # Flatten işlemi: (batch_size, channels, length) -> (batch_size, channels * length)
+        x = x.view(x.size(0), -1)
+        x = self.fc1(x)
+        x = self.ln1(x)
+        x = self.relu5(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x
 
 ###############################################
-# PyTorch Dataset Tanımı (Değişiklik yok)
+# PyTorch Dataset Tanımı - GÜNCELLENDİ (CNN için boyut ekleme)
 ###############################################
 class SpectralDataset(Dataset):
     def __init__(self, X, y):
-        self.X = X
-        self.y = y
+        self.X = X # numpy array (num_samples, num_features)
+        self.y = y # numpy array (num_samples,)
 
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
-        sample = torch.tensor(self.X[idx], dtype=torch.float32)
+        # CNN Conv1d (batch, channels, length) bekler. Channel=1 ekle.
+        sample = torch.tensor(self.X[idx], dtype=torch.float32).unsqueeze(0)
         label = torch.tensor(self.y[idx], dtype=torch.long)
         return sample, label
 
@@ -162,6 +194,7 @@ def print_class_based_accuracy(predictions):
             continue
 
         total_samples = len(class_df)
+        # Doğru tahmin: Gerçek etiket ile Tahmin etiketi aynı olanlar
         correct_predictions = len(class_df[class_df['Gerçek'] == class_df['Tahmin']])
 
         accuracy = (correct_predictions / total_samples) * 100 if total_samples > 0 else 0
@@ -174,10 +207,11 @@ def print_class_based_accuracy(predictions):
         print("")
 
 ###############################################
-# Ana Fonksiyon: Eğitim ve Tahmin (ANN) - Güncellendi
+# Ana Fonksiyon: Eğitim ve Tahmin (CNN) - GÜNCELLENDİ
 ###############################################
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Kullanılan cihaz: {device}")
 
     ##############################
     # 1. Eğitim
@@ -187,18 +221,29 @@ def main():
     print("Eğitim verisi yükleniyor...")
     # Mevcut kodda _a.csv okunuyor, ona göre data_a kullanılıyor.
     data_a, train_labels = load_data(TRAIN_DIR, mode='train')
+    if data_a.size == 0:
+        print("Hata: Eğitim verisi yüklenemedi veya hiç _a.csv dosyası bulunamadı.")
+        return
     print(f"Eğitim verisi boyutu: {data_a.shape}\n")
 
     # Tüm veriyi %80 eğitim, %20 doğrulama olarak ayırma
-    data_a_train, data_a_val, train_labels_train, train_labels_val = train_test_split(
-        data_a, train_labels, test_size=0.2, random_state=42, stratify=train_labels
-    )
+    # Stratify kullanarak sınıfların oranını koru
+    try:
+        data_a_train, data_a_val, train_labels_train, train_labels_val = train_test_split(
+            data_a, train_labels, test_size=0.2, random_state=42, stratify=train_labels
+        )
+    except ValueError as e:
+        print(f"train_test_split hatası: {e}. Sınıf sayısı az olabilir, stratify olmadan deneniyor.")
+        data_a_train, data_a_val, train_labels_train, train_labels_val = train_test_split(
+            data_a, train_labels, test_size=0.2, random_state=42
+        )
+
 
     # Etiket kodlama (ana/alt şeklinde)
     y_encoder = LabelEncoder()
     y_train = y_encoder.fit_transform(train_labels_train)
     y_val = y_encoder.transform(train_labels_val)
-    joblib.dump(y_encoder, "label_encoder.pkl")
+    joblib.dump(y_encoder, "label_encoder_cnn.pkl") # Farklı isimle kaydet
 
     # Dataset oluşturma
     train_dataset = SpectralDataset(data_a_train, y_train)
@@ -206,20 +251,18 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
-    # ANN modelini oluştur
-    input_size = data_a_train.shape[1]
-    hidden_size = 128 # Bu değeri ihtiyaca göre ayarlayabilirsiniz
+    # CNN modelini oluştur - GÜNCELLENDİ
+    input_size = data_a_train.shape[1] # Özellik sayısı (dalga boyu sayısı)
     num_classes = len(np.unique(y_train))
-    model = ANN(input_size, hidden_size, num_classes).to(device)
+    model = CNN(input_size, num_classes).to(device)
 
-    # Loss fonksiyonu, optimizer ve LR scheduler
+    # Loss fonksiyonu, optimizer ve LR scheduler - GÜNCELLENDİ
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001) # Başlangıç öğrenme oranı
-    # ReduceLROnPlateau: val_loss 5 epoch iyileşmezse LR'yi 0.1 ile çarpar
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
+    optimizer = optim.AdamW(model.parameters(), lr=0.01)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
 
-    # Eğitim parametreleri ve Early Stopping için değişkenler
-    num_epochs = 500 # Maksimum epoch sayısı (early stopping ile daha erken durabilir)
+    # Eğitim parametreleri ve Early Stopping için değişkenler - GÜNCELLENDİ
+    epochs = 5000 # Maksimum epoch sayısı
     early_stop_patience = 10 # Kaç epoch iyileşme olmazsa durdurulacak
     early_stop_counter = 0
     best_val_loss = float('inf')
@@ -234,18 +277,20 @@ def main():
     train_accuracies = []
     val_accuracies = []
 
-    print("ANN modeli eğitiliyor...\n")
-    for epoch in range(num_epochs):
+    print("CNN modeli eğitiliyor...\n")
+    for epoch in range(epochs):
         # --- Eğitim Aşaması ---
         model.train()
         running_train_loss = 0.0
         correct_train = 0
         total_train = 0
         for inputs, labels in train_loader:
+            # inputs boyutu: [batch_size, 1, input_size]
+            # labels boyutu: [batch_size]
             inputs, labels = inputs.to(device), labels.to(device)
 
             optimizer.zero_grad()
-            outputs = model(inputs)
+            outputs = model(inputs) # Model forward çağrısı
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
@@ -280,7 +325,7 @@ def main():
         val_losses.append(epoch_val_loss)
         val_accuracies.append(epoch_val_acc)
 
-        print(f'Epoch [{epoch+1}/{num_epochs}] - Train Loss: {epoch_train_loss:.4f}, Train Acc: {epoch_train_acc:.2f}% | Val Loss: {epoch_val_loss:.4f}, Val Acc: {epoch_val_acc:.2f}%')
+        print(f'Epoch [{epoch+1}/{epochs}] - Train Loss: {epoch_train_loss:.4f}, Train Acc: {epoch_train_acc:.2f}% | Val Loss: {epoch_val_loss:.4f}, Val Acc: {epoch_val_acc:.2f}%')
 
         # LR Scheduler'ı güncelle
         scheduler.step(epoch_val_loss)
@@ -293,8 +338,8 @@ def main():
             best_train_acc = epoch_train_acc   # En iyi epoch'taki train acc
             best_val_acc = epoch_val_acc     # En iyi epoch'taki val acc
             early_stop_counter = 0
-            # En iyi modeli kaydet
-            torch.save(model.state_dict(), "best_ann_model.pth")
+            # En iyi modeli kaydet - GÜNCELLENDİ (dosya adı)
+            torch.save(model.state_dict(), "best_cnn_model.pth")
             print(f"Epoch {epoch+1}: Validation loss düştü ({best_val_loss:.4f}). Model kaydedildi.")
         else:
             early_stop_counter += 1
@@ -305,7 +350,7 @@ def main():
 
     print(f"\nEğitim tamamlandı.")
     print(f"En iyi epoch: {best_epoch} - Train Loss: {best_train_loss:.4f}, Train Acc: {best_train_acc:.2f}% | Val Loss: {best_val_loss:.4f}, Val Acc: {best_val_acc:.2f}%")
-    print("En iyi model 'best_ann_model.pth' olarak kaydedildi.\n")
+    print("En iyi model 'best_cnn_model.pth' olarak kaydedildi.\n")
 
     # --- Grafik Çizimi ---
     plt.figure(figsize=(12, 5))
@@ -313,7 +358,8 @@ def main():
     plt.subplot(1, 2, 1)
     plt.plot(range(1, len(train_losses) + 1), train_losses, label='Train Loss')
     plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
-    plt.axvline(best_epoch, linestyle='--', color='r', label=f'Best Epoch ({best_epoch})')
+    if best_epoch != -1: # Eğer model hiç kaydedilmediyse hata vermesin
+        plt.axvline(best_epoch, linestyle='--', color='r', label=f'Best Epoch ({best_epoch})')
     plt.xlabel('Epochs')
     plt.ylabel('Loss')
     plt.title('Training and Validation Loss')
@@ -323,7 +369,8 @@ def main():
     plt.subplot(1, 2, 2)
     plt.plot(range(1, len(train_accuracies) + 1), train_accuracies, label='Train Accuracy')
     plt.plot(range(1, len(val_accuracies) + 1), val_accuracies, label='Validation Accuracy')
-    plt.axvline(best_epoch, linestyle='--', color='r', label=f'Best Epoch ({best_epoch})')
+    if best_epoch != -1:
+        plt.axvline(best_epoch, linestyle='--', color='r', label=f'Best Epoch ({best_epoch})')
     plt.xlabel('Epochs')
     plt.ylabel('Accuracy (%)')
     plt.title('Training and Validation Accuracy')
@@ -342,26 +389,31 @@ def main():
     try:
         # Sadece _a.csv yükle (eğitimde kullanılanla aynı olmalı)
         data_a_pred, true_labels = load_data(SAMPLE_DIR, mode='predict')
+        if data_a_pred.size == 0:
+             print("Hata: Tahmin verisi yüklenemedi veya hiç _a.csv dosyası bulunamadı.")
+             return
 
         # Tahmin için Dataset ve DataLoader
         # Tahmin için etiketler önemli değil, geçici bir dizi verilebilir (np.zeros)
         pred_dataset = SpectralDataset(data_a_pred, np.zeros(len(data_a_pred)))
         pred_loader = DataLoader(pred_dataset, batch_size=1, shuffle=False) # batch_size=1 genellikle tahmin için uygundur
 
-        # En iyi modeli yükle
-        print("En iyi model ('best_ann_model.pth') yükleniyor...")
+        # En iyi modeli yükle - GÜNCELLENDİ (model ve dosya adı)
+        print("En iyi model ('best_cnn_model.pth') yükleniyor...")
         # Model mimarisini tekrar tanımla ve kaydedilen ağırlıkları yükle
-        model = ANN(input_size, hidden_size, num_classes).to(device)
-        model.load_state_dict(torch.load("best_ann_model.pth", map_location=device))
-        model.eval() # Modeli değerlendirme moduna al
-        y_encoder = joblib.load("label_encoder.pkl") # Kaydedilen encoder'ı yükle
+        # input_size ve num_classes eğitimdekiyle aynı olmalı
+        model_pred = CNN(input_size, num_classes).to(device)
+        model_pred.load_state_dict(torch.load("best_cnn_model.pth", map_location=device))
+        model_pred.eval() # Modeli değerlendirme moduna al
+        y_encoder = joblib.load("label_encoder_cnn.pkl") # Kaydedilen encoder'ı yükle
 
         # Tahmin yap ve olasılıkları al
         predictions = []
         with torch.no_grad():
             for idx, (inputs, _) in enumerate(pred_loader):
+                # inputs boyutu: [1, 1, input_size]
                 inputs = inputs.to(device)
-                outputs = model(inputs)
+                outputs = model_pred(inputs)
                 # Olasılıkları almak için softmax uygula
                 probs = F.softmax(outputs, dim=1).cpu().numpy().flatten()
                 pred_idx = np.argmax(probs)
@@ -377,7 +429,8 @@ def main():
         print("\nTahmin işlemi başarıyla tamamlandı!")
 
     except FileNotFoundError:
-        print(f"Hata: 'best_ann_model.pth' veya 'label_encoder.pkl' bulunamadı. Lütfen önce modeli eğitin.")
+        # GÜNCELLENDİ (dosya adları)
+        print(f"Hata: 'best_cnn_model.pth' veya 'label_encoder_cnn.pkl' bulunamadı. Lütfen önce modeli eğitin.")
     except Exception as e:
         print(f"Tahmin sırasında bir hata oluştu: {str(e)}")
 
